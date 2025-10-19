@@ -41,22 +41,20 @@ def is_stablecoin(symbol: str) -> bool:
 
 def rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
     """
-    Wilder's RSI implementation using EMA with alpha=1/length.
-    Returns a Series aligned to `close`.
+    Wilder's RSI using EMA with alpha=1/length.
     """
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    # Wilder's smoothing (EMA with alpha = 1/length)
     avg_gain = gain.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
     avg_loss = loss.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
 
     rs = avg_gain / avg_loss.replace(0, pd.NA)
     rsi = 100 - (100 / (1 + rs))
-    rsi = rsi.bfill()
-rsi = rsi.infer_objects(copy=False)
-return rsi
+    rsi = rsi.bfill()                       # replaces deprecated fillna(method='backfill')
+    rsi = rsi.infer_objects(copy=False)     # silence future downcasting warning
+    return rsi
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -141,7 +139,6 @@ def price_above_listing(exchange, symbol, current_price) -> bool:
             earliest_open = candles[0][1]
             if earliest_open and current_price is not None:
                 return current_price >= earliest_open * 1.05
-        # If nothing returned, treat as "unknown"
         return not ENABLE_LISTING_PRICE  # pass if disabled; block if enabled
     except Exception as e:
         log.debug(f"Listing price check failed for {symbol}: {e}")
@@ -162,23 +159,18 @@ def evaluate_symbol(exchange, market) -> dict:
         rsi14 = row["rsi14"]
         last_close = row["close"]
 
-        # RSI14 not zero / valid
         if pd.isna(rsi14) or not (rsi14 > 0):
             return {"symbol": symbol, "eligible": False, "reason": "invalid RSI (0 or NaN)"}
 
-        # RSI14 < 30
         if float(rsi14) >= 30:
             return {"symbol": symbol, "eligible": False, "reason": f"RSI14={float(rsi14):.2f} >= 30"}
 
-        # SMA60 < SMA240
         if pd.isna(sma60) or pd.isna(sma240) or not (float(sma60) < float(sma240)):
             return {"symbol": symbol, "eligible": False, "reason": f"SMA60 !< SMA240"}
 
-        # Trades in last 24h
         if not had_trades_last_24h(df):
             return {"symbol": symbol, "eligible": False, "reason": "no trades last 24h (zero volume)"}
 
-        # Optional: listing price filter
         if ENABLE_LISTING_PRICE:
             if not price_above_listing(exchange, symbol, float(last_close)):
                 return {"symbol": symbol, "eligible": False, "reason": "below listing price +5%"}

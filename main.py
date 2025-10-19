@@ -54,7 +54,7 @@ def rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
 
     rs = avg_gain / avg_loss.replace(0, pd.NA)
     rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(method="backfill")
+    return rsi.bfill()
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """

@@ -2,6 +2,7 @@ import os
 import time
 import math
 import logging
+import random
 from datetime import datetime, timezone, timedelta
 import traceback
 
@@ -9,6 +10,7 @@ import ccxt
 import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential
 from dotenv import load_dotenv
+from ccxt.base.errors import DDoSProtection, ExchangeNotAvailable, RateLimitExceeded
 
 load_dotenv()
 
@@ -20,6 +22,8 @@ INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "900"))          # 15m default
 MAX_SYMBOLS_PER_RUN = int(os.getenv("MAX_SYMBOLS_PER_RUN", "20"))
 ENABLE_LISTING_PRICE = os.getenv("ENABLE_LISTING_PRICE", "0") == "1"
 MIN_USD_ORDER = float(os.getenv("MIN_USD_ORDER", "5"))
+# NEW: use a fixed per-order notional in DRY_RUN to avoid any private balance calls
+DRY_RUN_NOTIONAL = float(os.getenv("DRY_RUN_NOTIONAL", "100"))
 
 # Logging controls
 LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()           # DEBUG by default for "see everything"
@@ -29,7 +33,6 @@ API_KEY = os.getenv("API_KEY", "")
 API_SECRET = os.getenv("API_SECRET", "")
 
 # -------- Logging --------
-# Force reconfigure so Railway logs get our exact format/level even if a lib config'd logging earlier
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.DEBUG),
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -40,7 +43,7 @@ log.info("=== Bot boot ===")
 log.info(f"Config: EXCHANGE={EXCHANGE_ID} QUOTE_ASSET={QUOTE_ASSET} "
          f"DRY_RUN={DRY_RUN} INTERVAL_SEC={INTERVAL_SEC} MAX_SYMBOLS_PER_RUN={MAX_SYMBOLS_PER_RUN} "
          f"ENABLE_LISTING_PRICE={ENABLE_LISTING_PRICE} MIN_USD_ORDER={MIN_USD_ORDER} "
-         f"LOG_LEVEL={LOG_LEVEL} VERBOSE_SYMBOL_LOG={VERBOSE_SYMBOL_LOG}")
+         f"DRY_RUN_NOTIONAL={DRY_RUN_NOTIONAL} LOG_LEVEL={LOG_LEVEL} VERBOSE_SYMBOL_LOG={VERBOSE_SYMBOL_LOG}")
 
 # -------- Helpers --------
 STABLE_LIKE = {
@@ -64,8 +67,8 @@ def rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
 
     rs = avg_gain / avg_loss.replace(0, pd.NA)
     rsi = 100 - (100 / (1 + rs))
-    rsi = rsi.bfill()                       # replaces deprecated fillna(method='backfill')
-    rsi = rsi.infer_objects(copy=False)     # silence future downcasting warning
+    # silence deprecation/downcasting warnings
+    rsi = rsi.bfill().infer_objects(copy=False)
     return rsi
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -88,27 +91,66 @@ def had_trades_last_24h(df_15m: pd.DataFrame) -> (bool, float):
 # -------- Exchange --------
 def make_exchange() -> ccxt.Exchange:
     klass = getattr(ccxt, EXCHANGE_ID)
-    return klass({
+    ex = klass({
         "apiKey": API_KEY,
         "secret": API_SECRET,
         "enableRateLimit": True,
         "options": {"adjustForTimeDifference": True},
     })
+    # We'll toggle .verbose only for PUBLIC calls to avoid printing API-Key headers
+    ex.verbose = False
+    return ex
+
+def set_verbose_public(exchange: ccxt.Exchange, enabled: bool):
+    """Enable ccxt.verbose only for PUBLIC endpoints (avoid leaking API-Key on private)."""
+    try:
+        exchange.verbose = bool(enabled)
+    except Exception:
+        pass
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
 def fetch_ohlcv(exchange, symbol, timeframe="15m", limit=300):
-    return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    # Public call: allow verbose in DEBUG and add jitter to avoid bursts
+    set_verbose_public(exchange, LOG_LEVEL == "DEBUG")
+    try:
+        return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    finally:
+        set_verbose_public(exchange, False)
+        time.sleep(0.05 + random.random() * 0.05)
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
 def fetch_ohlcv_since(exchange, symbol, timeframe="1d", since=None, limit=2000):
-    return exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
+    set_verbose_public(exchange, LOG_LEVEL == "DEBUG")
+    try:
+        return exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
+    finally:
+        set_verbose_public(exchange, False)
+        time.sleep(0.05 + random.random() * 0.05)
 
-def get_quote_balance(exchange, quote_asset: str) -> float:
-    bal = exchange.fetch_balance()
-    free = bal.get("free", {}).get(quote_asset, 0.0)
-    if not free:
-        free = bal.get("total", {}).get(quote_asset, 0.0)
-    return float(free or 0.0)
+def safe_get_quote_balance(exchange, quote_asset: str) -> float:
+    """
+    Fetches quote balance using Kraken private API with polite handling.
+    Returns 0.0 on failure so caller can skip orders.
+    """
+    # Ensure verbose is OFF for private calls
+    set_verbose_public(exchange, False)
+    try:
+        bal = exchange.fetch_balance()  # Kraken: /0/private/BalanceEx
+        free = bal.get("free", {}).get(quote_asset, 0.0)
+        if not free:
+            free = bal.get("total", {}).get(quote_asset, 0.0)
+        return float(free or 0.0)
+    except DDoSProtection as e:
+        log.warning(f"Balance fetch lockout/rate-limit: {e}. Backing off 180s; skipping orders this run.")
+        time.sleep(180)
+        return 0.0
+    except (RateLimitExceeded, ExchangeNotAvailable) as e:
+        log.warning(f"Balance fetch throttled/unavailable: {e}. Backing off 60s; skipping orders this run.")
+        time.sleep(60)
+        return 0.0
+    except Exception as e:
+        log.warning(f"Balance fetch failed: {e}. Skipping orders this run.")
+        return 0.0
 
 def select_markets(exchange, quote_asset: str):
     markets = exchange.load_markets()
@@ -136,6 +178,9 @@ def select_markets(exchange, quote_asset: str):
     return symbols
 
 def place_market_buy(exchange, market, notional):
+    # Private path — keep verbose OFF
+    set_verbose_public(exchange, False)
+    # fetch_ticker is public; still fine to keep verbose off here
     ticker = exchange.fetch_ticker(market["symbol"])
     price = ticker.get("last")
     if not price or price <= 0:
@@ -267,12 +312,7 @@ def main_loop():
             symbols = select_markets(exchange, QUOTE_ASSET)
             log.info(f"Evaluating up to {min(len(symbols), MAX_SYMBOLS_PER_RUN)} of {len(symbols)} symbols (quote={QUOTE_ASSET})")
 
-            quote_bal = get_quote_balance(exchange, QUOTE_ASSET)
-            log.info(f"Quote balance {QUOTE_ASSET}: {quote_bal:.8f}")
-            notional = quote_bal * 0.05
-            if notional < MIN_USD_ORDER:
-                log.info(f"Notional {notional:.2f} < MIN_USD_ORDER {MIN_USD_ORDER:.2f} — will skip orders this run.")
-
+            # ---------- PUBLIC: Evaluate first ----------
             to_check = symbols[:MAX_SYMBOLS_PER_RUN]
             eligible = []
             ineligible = []
@@ -284,11 +324,6 @@ def main_loop():
                     log.info(f"ELIGIBLE: {sym} | RSI14={res['rsi14']:.2f} "
                              f"SMA60={res['sma60']:.6f} < SMA240={res['sma240']:.6f} "
                              f"LAST={res['last']:.8f} VOL24H={res.get('vol24h', 0):.4f}")
-                    if notional >= MIN_USD_ORDER:
-                        try:
-                            place_market_buy(exchange, market, notional=notional)
-                        except Exception as e:
-                            log.exception(f"Order failed for {sym}")
                 else:
                     ineligible.append(res)
                     if VERBOSE_SYMBOL_LOG:
@@ -299,9 +334,31 @@ def main_loop():
                         notes = (" | " + ", ".join(str(x) for x in note_parts)) if note_parts else ""
                         log.debug(f"INELIGIBLE: {sym} — {res.get('reason')}{notes}")
 
-            # End-of-run summaries
-            log.info(f"Run summary: {len(eligible)} eligible, {len(ineligible)} ineligible (checked {len(to_check)})")
+            log.info(f"Run summary (pre-balance): {len(eligible)} eligible, {len(ineligible)} ineligible (checked {len(to_check)})")
             print_eligible_table(eligible)
+
+            # ---------- PRIVATE: Only fetch balance if we might place orders ----------
+            if not eligible:
+                log.info("No eligible symbols. Skipping balance fetch and orders.")
+            else:
+                if DRY_RUN:
+                    notional = DRY_RUN_NOTIONAL
+                    log.info(f"DRY_RUN=1 → Using DRY_RUN_NOTIONAL={notional:.2f} per order (no private balance call).")
+                else:
+                    quote_bal = safe_get_quote_balance(exchange, QUOTE_ASSET)  # may back off inside
+                    log.info(f"Quote balance {QUOTE_ASSET}: {quote_bal:.8f}")
+                    notional = quote_bal * 0.05
+                    if notional < MIN_USD_ORDER:
+                        log.info(f"Notional {notional:.2f} < MIN_USD_ORDER {MIN_USD_ORDER:.2f} — will skip orders this run.")
+
+                if DRY_RUN or notional >= MIN_USD_ORDER:
+                    for res in eligible:
+                        sym = res["symbol"]
+                        try:
+                            market = exchange.market(sym)
+                            place_market_buy(exchange, market, notional=notional)
+                        except Exception as e:
+                            log.exception(f"Order failed for {sym}")
 
         except Exception as e:
             log.exception("Top-level loop error")

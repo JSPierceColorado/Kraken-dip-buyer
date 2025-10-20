@@ -49,6 +49,7 @@ log.info(f"Config: EXCHANGE={EXCHANGE_ID} QUOTE_ASSET={QUOTE_ASSET} "
 STABLE_LIKE = {
     "USD", "USDT", "USDC", "DAI", "EUR", "GBP", "TUSD", "FDUSD", "PYUSD", "BUSD", "GUSD", "USDP"
 }
+BTC_BASES = {"BTC", "XBT"}  # accommodate exchanges that label BTC as XBT (e.g., Kraken)
 
 def is_stablecoin(symbol: str) -> bool:
     base = symbol.split("/")[0]
@@ -87,6 +88,61 @@ def had_trades_last_24h(df_15m: pd.DataFrame) -> (bool, float):
     # last 96 * 15m = 24h
     vol_24h = float(df_15m["volume"].tail(96).sum())
     return bool(vol_24h and vol_24h > 0), vol_24h
+
+# ---- NEW: market-wide BTC MA condition (15m SMA180 < SMA720) ----
+def find_btc_symbol(exchange, quote_asset: str) -> str | None:
+    """
+    Try to find a BTC/XBT market for the given quote (e.g., BTC/USD, XBT/USD).
+    Returns unified symbol string or None.
+    """
+    markets = exchange.load_markets()
+    candidates = []
+    for m in markets.values():
+        if not m.get("active", True):
+            continue
+        if not m.get("spot", False):
+            continue
+        if m.get("quote") != quote_asset:
+            continue
+        base = (m.get("base") or "").upper()
+        if base in BTC_BASES:
+            candidates.append(m["symbol"])
+    # Prefer 'BTC/QUOTE' if present, else first XBT/QUOTE
+    for sym in candidates:
+        if sym.upper().startswith("BTC/"):
+            return sym
+    return candidates[0] if candidates else None
+
+def check_btc_ma_condition(exchange, quote_asset: str, timeframe: str = "15m") -> tuple[bool, str, dict]:
+    """
+    Returns (ok, note, metrics) where ok is True iff SMA180 < SMA720.
+    metrics includes last, sma180, sma720, symbol.
+    If data insufficient/unavailable, returns ok=False with a note.
+    """
+    btc_sym = find_btc_symbol(exchange, quote_asset)
+    if not btc_sym:
+        return False, f"No BTC market found for quote={quote_asset}", {}
+
+    try:
+        # need at least 720 candles for SMA720; fetch extra for safety
+        ohlcv = fetch_ohlcv(exchange, btc_sym, timeframe=timeframe, limit=1000)
+        if not ohlcv or len(ohlcv) < 720:
+            return False, f"{btc_sym} insufficient candles for SMA720 (have {len(ohlcv) if ohlcv else 0})", {"symbol": btc_sym}
+
+        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
+        close = df["close"]
+        sma180 = close.rolling(window=180, min_periods=180).mean().iloc[-1]
+        sma720 = close.rolling(window=720, min_periods=720).mean().iloc[-1]
+        last = float(close.iloc[-1])
+
+        if pd.isna(sma180) or pd.isna(sma720):
+            return False, f"{btc_sym} SMA values NaN", {"symbol": btc_sym}
+
+        ok = float(sma180) < float(sma720)
+        note = (f"{btc_sym} 15m SMA180={float(sma180):.6f} < SMA720={float(sma720):.6f} ⇒ {ok} | last={last:.10g}")
+        return ok, note, {"symbol": btc_sym, "sma180": float(sma180), "sma720": float(sma720), "last": last}
+    except Exception as e:
+        return False, f"{btc_sym} MA check error: {e}", {"symbol": btc_sym}
 
 # -------- Exchange --------
 def make_exchange() -> ccxt.Exchange:
@@ -309,6 +365,10 @@ def main_loop():
 
     while True:
         try:
+            # ---- NEW: check the BTC market regime gate (15m SMA180 < SMA720) ----
+            btc_ok, btc_note, btc_metrics = check_btc_ma_condition(exchange, QUOTE_ASSET, timeframe="15m")
+            log.info(f"BTC regime gate: {btc_note}")
+
             symbols = select_markets(exchange, QUOTE_ASSET)
             log.info(f"Evaluating up to {min(len(symbols), MAX_SYMBOLS_PER_RUN)} of {len(symbols)} symbols (quote={QUOTE_ASSET})")
 
@@ -341,24 +401,28 @@ def main_loop():
             if not eligible:
                 log.info("No eligible symbols. Skipping balance fetch and orders.")
             else:
-                if DRY_RUN:
-                    notional = DRY_RUN_NOTIONAL
-                    log.info(f"DRY_RUN=1 → Using DRY_RUN_NOTIONAL={notional:.2f} per order (no private balance call).")
+                # NEW: apply BTC regime gate before any private balance calls / orders
+                if not btc_ok:
+                    log.info("BTC 15m SMA180 < SMA720 condition NOT met — skipping all buy orders this run.")
                 else:
-                    quote_bal = safe_get_quote_balance(exchange, QUOTE_ASSET)  # may back off inside
-                    log.info(f"Quote balance {QUOTE_ASSET}: {quote_bal:.8f}")
-                    notional = quote_bal * 0.05
-                    if notional < MIN_USD_ORDER:
-                        log.info(f"Notional {notional:.2f} < MIN_USD_ORDER {MIN_USD_ORDER:.2f} — will skip orders this run.")
+                    if DRY_RUN:
+                        notional = DRY_RUN_NOTIONAL
+                        log.info(f"DRY_RUN=1 → Using DRY_RUN_NOTIONAL={notional:.2f} per order (no private balance call).")
+                    else:
+                        quote_bal = safe_get_quote_balance(exchange, QUOTE_ASSET)  # may back off inside
+                        log.info(f"Quote balance {QUOTE_ASSET}: {quote_bal:.8f}")
+                        notional = quote_bal * 0.05
+                        if notional < MIN_USD_ORDER:
+                            log.info(f"Notional {notional:.2f} < MIN_USD_ORDER {MIN_USD_ORDER:.2f} — will skip orders this run.")
 
-                if DRY_RUN or notional >= MIN_USD_ORDER:
-                    for res in eligible:
-                        sym = res["symbol"]
-                        try:
-                            market = exchange.market(sym)
-                            place_market_buy(exchange, market, notional=notional)
-                        except Exception as e:
-                            log.exception(f"Order failed for {sym}")
+                    if btc_ok and (DRY_RUN or notional >= MIN_USD_ORDER):
+                        for res in eligible:
+                            sym = res["symbol"]
+                            try:
+                                market = exchange.market(sym)
+                                place_market_buy(exchange, market, notional=notional)
+                            except Exception as e:
+                                log.exception(f"Order failed for {sym}")
 
         except Exception as e:
             log.exception("Top-level loop error")

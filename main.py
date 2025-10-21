@@ -8,6 +8,7 @@ import traceback
 
 import ccxt
 import pandas as pd
+import numpy as np  # <-- added
 from tenacity import retry, stop_after_attempt, wait_exponential
 from dotenv import load_dotenv
 from ccxt.base.errors import DDoSProtection, ExchangeNotAvailable, RateLimitExceeded
@@ -66,10 +67,11 @@ def rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
     avg_gain = gain.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
     avg_loss = loss.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
 
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    # Keep float dtype by using np.nan instead of pd.NA to avoid future downcasting warnings
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    # silence deprecation/downcasting warnings
-    rsi = rsi.bfill().infer_objects(copy=False)
+    rsi = rsi.bfill()  # stays float-typed
+
     return rsi
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
